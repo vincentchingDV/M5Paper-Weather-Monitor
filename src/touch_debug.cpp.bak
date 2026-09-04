@@ -1,0 +1,141 @@
+/*
+ * M5Paper Touch Debug - Comprehensive Test
+ * Tests touch hardware and coordinates
+ */
+
+#include <M5EPD.h>
+
+M5EPD_Canvas canvas(&M5.EPD);
+
+void setup() {
+  M5.begin(false, false, true, true, false);
+  M5.EPD.SetRotation(0);
+  M5.TP.SetRotation(0);
+  M5.EPD.Clear(true);
+
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println("\n=== M5Paper Touch Comprehensive Debug ===\n");
+
+  canvas.createCanvas(960, 540);
+
+  // Test 1: Check if TP is available
+  Serial.println("Test 1: Checking M5.TP status...");
+  Serial.printf("  M5.TP object exists: yes\n");
+
+  // Display instructions
+  canvas.fillCanvas(0);
+  canvas.setTextSize(3);
+  canvas.setTextColor(15);
+  canvas.drawString("Touch Debug Test", 200, 50);
+
+  canvas.setTextSize(2);
+  canvas.drawString("Instructions:", 50, 120);
+  canvas.drawString("1. Tap top-left corner (50,100)", 60, 160);
+  canvas.drawString("2. Tap center (480,270)", 60, 200);
+  canvas.drawString("3. Tap bottom-right (910,430)", 60, 240);
+  canvas.drawString("Watch serial output for coordinates", 60, 300);
+  canvas.drawString("Current touch: waiting...", 50, 400);
+
+  canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+
+  Serial.println("\nStarting touch polling loop...");
+  Serial.println("Tap the screen now!\n");
+}
+
+void loop() {
+  static uint32_t loopCount = 0;
+  static uint32_t lastTouchTime = 0;
+  loopCount++;
+
+  // Print status every 2 seconds
+  if (loopCount % 20 == 0) {
+    Serial.printf("Loop %lu - Waiting for touch...\n", loopCount);
+  }
+
+  // Method 1: Check M5.TP.available()
+  bool hasTouch = M5.TP.available();
+
+  if (hasTouch) {
+    Serial.printf("\n*** M5.TP.available() returned TRUE ***\n");
+
+    // Try to read touch
+    auto tp = M5.TP.readFinger(0);
+
+    uint32_t now = millis();
+    if (now - lastTouchTime > 500) {  // Debounce
+      Serial.printf("Touch Point 0: x=%d, y=%d\n", tp.x, tp.y);
+
+      // Additional debug info
+      Serial.printf("  Raw values: x=%d, y=%d\n", tp.x, tp.y);
+      Serial.printf("  Expected ranges: x=0-960, y=0-540\n");
+
+      // Determine which area was touched
+      if (tp.x > 0 && tp.x < 150 && tp.y > 100 && tp.y < 200) {
+        Serial.println("  Location: TOP-LEFT (expected area 1)");
+      } else if (tp.x > 400 && tp.x < 560 && tp.y > 200 && tp.y < 340) {
+        Serial.println("  Location: CENTER (expected area 2)");
+      } else if (tp.x > 800 && tp.x < 960 && tp.y > 400 && tp.y < 540) {
+        Serial.println("  Location: BOTTOM-RIGHT (expected area 3)");
+      } else {
+        Serial.printf("  Location: OTHER (x=%d, y=%d)\n", tp.x, tp.y);
+      }
+
+      // Update screen
+      canvas.fillCanvas(0);
+      canvas.setTextSize(2);
+      canvas.setTextColor(15);
+      char buffer[100];
+      snprintf(buffer, sizeof(buffer), "Touch X: %d", tp.x);
+      canvas.drawString(buffer, 50, 200);
+      snprintf(buffer, sizeof(buffer), "Touch Y: %d", tp.y);
+      canvas.drawString(buffer, 50, 250);
+      canvas.drawString("Tap again!", 50, 350);
+      canvas.pushCanvas(0, 0, UPDATE_MODE_DU4);
+
+      lastTouchTime = now;
+    }
+  } else {
+    // No touch detected - try alternative read methods
+    static uint32_t altCheckCount = 0;
+    altCheckCount++;
+
+    if (altCheckCount % 100 == 0) {
+      // Try alternative methods
+      Serial.printf("Loop %lu: M5.TP.available() = false\n", loopCount);
+
+      // Try reading anyway (in case available() has a bug)
+      auto tp = M5.TP.readFinger(0);
+      if (tp.x != 0 || tp.y != 0) {
+        Serial.printf("  WARNING: readFinger() returned x=%d, y=%d despite available()=false\n", tp.x, tp.y);
+      }
+    }
+  }
+
+  delay(100);
+}
+
+/*
+ * INTERPRETATION GUIDE:
+ *
+ * If you see "M5.TP.available() returned TRUE" and coordinates:
+ *   -> Touch IS working! Coordinates just need mapping/rotation adjustment
+ *   -> Note the values when tapping different corners
+ *   -> We can fix the coordinate system
+ *
+ * If you NEVER see "available() returned TRUE":
+ *   -> Touch controller might not be initialized
+ *   -> Try different M5.begin() parameters
+ *   -> Check if GT911 is actually on I2C bus
+ *
+ * If coordinates are always 0:
+ *   -> Touch detected but coordinate reading broken
+ *   -> Try readFinger(1), readFinger(2)
+ *   -> May need to read differently
+ *
+ * Expected coordinates when tapping:
+ *   - Top-left (50,100): should give x~50, y~100
+ *   - Center (480,270): should give x~480, y~270
+ *   - Bottom-right (910,430): should give x~910, y~430
+ */

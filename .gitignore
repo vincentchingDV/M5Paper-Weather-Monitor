@@ -1,0 +1,26 @@
+# PlatformIO build and dependency directories
+.pio/
+.platformio/
+build/
+.clang_complete
+.gcc-flags.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Archives
+*.zip
+*.tar.gz

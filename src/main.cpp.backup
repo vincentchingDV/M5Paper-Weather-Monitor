@@ -1,0 +1,484 @@
+#include <M5EPD.h>
+#include <WiFi.h>
+#include <SPIFFS.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+M5EPD_Canvas canvas(&M5.EPD);
+
+struct {
+  char ssid[64];
+  char password[64];
+} wifi_config = {};
+
+struct {
+  float temp;
+  int humidity;
+  String condition;
+} hk_weather = {0, 0, "N/A"};
+
+uint32_t last_weather_update = 0;
+const uint32_t WEATHER_UPDATE_INTERVAL = 600000;
+
+void drawErrorScreen(const char* error);
+void enterSetupMode();
+void loadWiFiConfig();
+void connectToWiFi();
+void fetchWeather();
+void drawDualScreen(float roomTemp, float roomHum, uint32_t battMv);
+String touchInputScreen(const char* title, bool isPassword);
+void saveWiFiConfig();
+int scanWiFiNetworks(String networks[], int maxNetworks);
+int selectSSIDFromList(String networks[], int count);
+
+void setup() {
+  M5.begin();  // Use default parameters
+  M5.EPD.SetRotation(0);
+  M5.TP.SetRotation(0);
+  M5.EPD.Clear(true);
+
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n\n=== M5Paper Weather Monitor ===");
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed!");
+    drawErrorScreen("SPIFFS Error");
+    return;
+  }
+
+  M5.SHT30.Begin();
+  canvas.createCanvas(960, 540);
+
+  loadWiFiConfig();
+
+  if (strlen(wifi_config.ssid) == 0) {
+    Serial.println("No WiFi config found. Entering setup mode...");
+    enterSetupMode();
+  } else {
+    connectToWiFi();
+  }
+}
+
+void loop() {
+  M5.SHT30.UpdateData();
+  float temperature = M5.SHT30.GetTemperature();
+  float humidity = M5.SHT30.GetRelHumidity();
+  uint32_t battery = M5.getBatteryVoltage();
+
+  if (millis() - last_weather_update > WEATHER_UPDATE_INTERVAL && WiFi.status() == WL_CONNECTED) {
+    fetchWeather();
+    last_weather_update = millis();
+  }
+
+  Serial.printf("Room: %.1f°C, %.0f%% | HK: %.1f°C, %s\n",
+                temperature, humidity, hk_weather.temp, hk_weather.condition.c_str());
+
+  drawDualScreen(temperature, humidity, battery);
+  delay(60000);
+}
+
+// ============ WiFi NETWORK SCANNING ============
+int scanWiFiNetworks(String networks[], int maxNetworks) {
+  canvas.fillCanvas(0);
+  canvas.setTextSize(3);
+  canvas.setTextColor(15);
+  canvas.drawString("Scanning WiFi...", 200, 250);
+  canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+
+  Serial.println("Scanning WiFi networks...");
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  int networkCount = WiFi.scanNetworks();
+  Serial.printf("Found %d networks\n", networkCount);
+
+  int added = 0;
+  for (int i = 0; i < networkCount && added < maxNetworks; i++) {
+    networks[added] = WiFi.SSID(i);
+    Serial.printf("  %d: %s (RSSI: %d)\n", added, networks[added].c_str(), WiFi.RSSI(i));
+    added++;
+  }
+
+  return added;
+}
+
+// ============ SSID SELECTION SCREEN ============
+int selectSSIDFromList(String networks[], int count) {
+  int itemsPerPage = 5;
+  int startIdx = 0;
+  int endIdx = min(startIdx + itemsPerPage, count);
+
+  // Draw initial screen
+  canvas.fillCanvas(0);
+  canvas.setTextSize(3);
+  canvas.setTextColor(15);
+  canvas.drawString("Select WiFi Network", 100, 20);
+  canvas.drawFastHLine(40, 70, 880, 15);
+
+  for (int i = startIdx; i < endIdx; i++) {
+    int yPos = 100 + (i - startIdx) * 80;
+    canvas.drawRect(50, yPos, 860, 70, 15);
+    canvas.setTextSize(2);
+    canvas.setTextColor(15);
+    canvas.drawString(networks[i], 70, yPos + 20);
+  }
+
+  canvas.setTextSize(2);
+  canvas.drawString("Tap to select", 50, 500);
+  canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+
+  Serial.println("Waiting for SSID selection...");
+  uint32_t lastTouchTime = 0;
+
+  while (true) {
+    delay(100);
+
+    if (M5.TP.available()) {
+      M5.TP.update();
+
+      if (!M5.TP.isFingerUp()) {
+        uint32_t now = millis();
+        if (now - lastTouchTime < 500) continue;
+
+        tp_finger_t finger = M5.TP.readFinger(0);
+        int y = finger.y;
+        lastTouchTime = now;
+
+        Serial.printf("Touch at y=%d\n", y);
+
+        for (int i = startIdx; i < endIdx; i++) {
+          int yPos = 100 + (i - startIdx) * 80;
+          if (y > yPos && y < yPos + 70) {
+            Serial.printf("Selected SSID: %s\n", networks[i].c_str());
+            delay(1000);
+            return i;
+          }
+        }
+      }
+    }
+  }
+}
+
+// ============ TOUCH KEYBOARD INPUT ============
+String touchInputScreen(const char* title, bool isPassword) {
+  String input = "";
+  bool done = false;
+  uint32_t lastTouchTime = 0;
+  const uint32_t DEBOUNCE_MS = 400;
+
+  const char* keyboard = "qwertyuiopasdfghjklzxcvbnm0123456789.-";
+  const int cols = 10;
+  const int rows = 4;
+  int keyW = 85, keyH = 70;
+  int startX = 40, startY = 120;
+
+  while (!done) {
+    canvas.fillCanvas(0);
+
+    // Title
+    canvas.setTextSize(3);
+    canvas.setTextColor(15);
+    canvas.drawString(title, 50, 20);
+
+    // Input display
+    canvas.setTextSize(3);
+    String display = "";
+    if (isPassword) {
+      for (int i = 0; i < input.length(); i++) {
+        display += "*";
+      }
+    } else {
+      display = input;
+    }
+    canvas.drawString(display, 50, 80);
+    canvas.drawFastHLine(50, 110, 860, 15);
+
+    // Keyboard
+    int keyIndex = 0;
+    for (int row = 0; row < rows && keyIndex < strlen(keyboard); row++) {
+      for (int col = 0; col < cols && keyIndex < strlen(keyboard); col++) {
+        int x = startX + col * keyW;
+        int y = startY + row * keyH;
+        char key = keyboard[keyIndex];
+
+        canvas.drawRect(x, y, keyW - 5, keyH - 5, 15);
+        canvas.setTextSize(2);
+        canvas.drawString(String(key), x + 30, y + 20);
+        keyIndex++;
+      }
+    }
+
+    // Buttons
+    canvas.setTextSize(2);
+    canvas.drawRect(50, 480, 200, 40, 15);
+    canvas.drawString("CLEAR", 95, 492);
+
+    canvas.drawRect(300, 480, 200, 40, 15);
+    canvas.drawString("DONE", 370, 492);
+
+    canvas.drawRect(550, 480, 200, 40, 15);
+    canvas.drawString("CANCEL", 600, 492);
+
+    canvas.pushCanvas(0, 0, UPDATE_MODE_DU4);
+
+    // Wait for touch with debounce
+    if (M5.TP.available()) {
+      M5.TP.update();
+
+      if (!M5.TP.isFingerUp()) {
+        uint32_t now = millis();
+        if (now - lastTouchTime < DEBOUNCE_MS) {
+          delay(50);
+          continue;
+        }
+
+        tp_finger_t finger = M5.TP.readFinger(0);
+        int x = finger.x;
+        int y = finger.y;
+        lastTouchTime = now;
+
+        // Check keyboard
+        keyIndex = 0;
+        bool keyPressed = false;
+        for (int row = 0; row < rows && keyIndex < strlen(keyboard); row++) {
+          for (int col = 0; col < cols && keyIndex < strlen(keyboard); col++) {
+            int kx = startX + col * keyW;
+            int ky = startY + row * keyH;
+
+            if (x > kx && x < kx + keyW - 5 && y > ky && y < ky + keyH - 5) {
+              if (input.length() < 60) {
+                input += keyboard[keyIndex];
+              }
+              keyPressed = true;
+              break;
+            }
+            keyIndex++;
+          }
+          if (keyPressed) break;
+        }
+
+        // Check buttons
+        if (!keyPressed) {
+          if (x > 50 && x < 250 && y > 480 && y < 520) {
+            input = "";
+          } else if (x > 300 && x < 500 && y > 480 && y < 520) {
+            done = true;
+          } else if (x > 550 && x < 750 && y > 480 && y < 520) {
+            return "";
+          }
+        }
+      }
+    }
+
+    delay(50);
+  }
+
+  return input;
+}
+
+// ============ SETUP MODE ============
+void enterSetupMode() {
+  Serial.println("\n=== ENTERING WIFI SETUP MODE ===");
+
+  // Scan and select SSID
+  String networks[20];
+  int networkCount = scanWiFiNetworks(networks, 20);
+
+  if (networkCount == 0) {
+    canvas.fillCanvas(0);
+    canvas.setTextSize(3);
+    canvas.setTextColor(15);
+    canvas.drawString("No networks found", 150, 250);
+    canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+    delay(3000);
+    return;
+  }
+
+  int selectedIdx = selectSSIDFromList(networks, networkCount);
+  String ssid = networks[selectedIdx];
+
+  // Enter password
+  String password = touchInputScreen("Enter WiFi Password", true);
+  if (password.length() == 0) return;
+
+  // Save config
+  ssid.toCharArray(wifi_config.ssid, sizeof(wifi_config.ssid));
+  password.toCharArray(wifi_config.password, sizeof(wifi_config.password));
+
+  saveWiFiConfig();
+
+  Serial.println("\n✓ Config saved! Rebooting...");
+  canvas.fillCanvas(0);
+  canvas.setTextSize(3);
+  canvas.setTextColor(15);
+  canvas.drawString("Config Saved!", 200, 200);
+  canvas.setTextSize(2);
+  canvas.drawString("Rebooting in 3 seconds...", 150, 300);
+  canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+
+  delay(3000);
+  ESP.restart();
+}
+
+void saveWiFiConfig() {
+  File file = SPIFFS.open("/wifi_config.txt", FILE_WRITE);
+  if (file) {
+    file.printf("%s\n%s\n",
+                wifi_config.ssid,
+                wifi_config.password);
+    file.close();
+    Serial.println("Config written to SPIFFS");
+  }
+}
+
+void loadWiFiConfig() {
+  if (!SPIFFS.exists("/wifi_config.txt")) {
+    Serial.println("No config file found");
+    return;
+  }
+
+  File file = SPIFFS.open("/wifi_config.txt", FILE_READ);
+  if (file) {
+    file.readStringUntil('\n').toCharArray(wifi_config.ssid, sizeof(wifi_config.ssid));
+    file.readStringUntil('\n').toCharArray(wifi_config.password, sizeof(wifi_config.password));
+    file.close();
+    Serial.printf("Loaded config: SSID=%s\n", wifi_config.ssid);
+  }
+}
+
+// ============ WiFi CONNECTIVITY ============
+void connectToWiFi() {
+  Serial.printf("Connecting to WiFi: %s\n", wifi_config.ssid);
+
+  canvas.fillCanvas(0);
+  canvas.setTextSize(3);
+  canvas.setTextColor(15);
+  canvas.drawString("Connecting WiFi...", 150, 200);
+  canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifi_config.ssid, wifi_config.password);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n✓ WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    configTime(28800, 0, "pool.ntp.org");
+    fetchWeather();
+  } else {
+    Serial.println("\n✗ WiFi connection failed!");
+    drawErrorScreen("WiFi Failed");
+  }
+}
+
+// ============ WEATHER API ============
+void fetchWeather() {
+  if (!WiFi.isConnected()) {
+    Serial.println("WiFi not connected, skipping weather update");
+    return;
+  }
+
+  HTTPClient http;
+  String url = "https://wttr.in/Hong%20Kong?format=j1";
+
+  Serial.printf("Fetching weather from wttr.in...\n");
+
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+    String payload = http.getString();
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (!error) {
+      JsonArray current = doc["current_condition"];
+      if (current.size() > 0) {
+        hk_weather.temp = current[0]["temp_C"];
+        hk_weather.humidity = current[0]["humidity"];
+        hk_weather.condition = String((const char*)current[0]["weatherDesc"][0]["value"]);
+
+        Serial.printf("Weather: %.0f°C (%s), Humidity: %d%%\n",
+                      hk_weather.temp, hk_weather.condition.c_str(), hk_weather.humidity);
+      }
+    }
+  } else {
+    Serial.printf("HTTP error: %d\n", httpCode);
+  }
+
+  http.end();
+}
+
+// ============ DISPLAY ============
+void drawDualScreen(float roomTemp, float roomHum, uint32_t battMv) {
+  canvas.fillCanvas(0);
+
+  canvas.setTextSize(3);
+  canvas.setTextColor(15);
+  canvas.drawString("Room Monitor", 40, 20);
+  canvas.drawFastHLine(40, 70, 880, 15);
+
+  // LEFT SIDE: Room Data
+  canvas.setTextSize(6);
+  canvas.drawString(String(roomTemp, 1) + "C", 60, 120);
+
+  canvas.setTextSize(3);
+  canvas.drawString("Room Temp", 60, 230);
+
+  canvas.setTextSize(5);
+  canvas.drawString(String(roomHum, 0) + "%", 60, 310);
+
+  canvas.setTextSize(3);
+  canvas.drawString("Humidity", 60, 420);
+
+  // Divider
+  canvas.drawFastVLine(480, 100, 380, 15);
+
+  // RIGHT SIDE: Hong Kong Weather
+  if (hk_weather.temp > -100) {
+    canvas.setTextSize(6);
+    canvas.drawString(String(hk_weather.temp, 0) + "C", 520, 120);
+
+    canvas.setTextSize(3);
+    canvas.drawString("Hong Kong", 520, 230);
+
+    canvas.setTextSize(4);
+    canvas.drawString(hk_weather.condition, 520, 300);
+
+    canvas.setTextSize(2);
+    canvas.drawString("Hum: " + String(hk_weather.humidity) + "%", 520, 380);
+  } else {
+    canvas.setTextSize(3);
+    canvas.drawString("Loading...", 520, 200);
+  }
+
+  // Footer
+  canvas.setTextSize(2);
+  canvas.drawString("Batt: " + String(battMv / 1000.0, 2) + "V", 40, 500);
+
+  if (WiFi.isConnected()) {
+    canvas.drawString("WiFi: OK", 400, 500);
+  } else {
+    canvas.drawString("WiFi: Offline", 400, 500);
+  }
+
+  canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+}
+
+void drawErrorScreen(const char* error) {
+  canvas.fillCanvas(0);
+  canvas.setTextSize(4);
+  canvas.setTextColor(15);
+  canvas.drawString("ERROR", 350, 150);
+  canvas.setTextSize(3);
+  canvas.drawString(error, 250, 250);
+  canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+}
