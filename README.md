@@ -1,6 +1,19 @@
-# M5Paper Temperature & Humidity Monitor
+# M5Paper Weather Monitor
 
-A firmware for the M5Stack M5Paper e-ink display that continuously monitors and displays room temperature and humidity using the built-in SHT30 sensor.
+A complete embedded weather monitoring application for the M5Stack M5Paper e-ink device that displays room temperature/humidity and Hong Kong weather with WiFi configuration via touch interface.
+
+## Working Demo
+
+![M5Paper Weather Monitor Demo](screenshot-working.jpg)
+
+**Features:**
+- Room temperature & humidity from built-in SHT30 sensor
+- Hong Kong weather from wttr.in API (updates every 10 minutes)
+- WiFi configuration via touch-based QWERTY keyboard
+- Persistent WiFi settings in SPIFFS
+- Split-screen display layout
+- Real-time weather fetching after setup cancellation
+- Serial debug output monitoring
 
 ## Hardware
 
